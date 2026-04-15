@@ -5,6 +5,9 @@ fetcher.py
 2. 从东方财富获取全部场内 ETF 列表
 3. 将板块按名称匹配到代表 ETF（按成交额优先）
 4. 通过 yfinance 下载 ETF 日线数据（增强容错：失败重试 + 退避）
+
+改动（2026-04-15）：
+- match_sectors_to_etfs: 同一只ETF只输出一次（去重），保留“最佳板块匹配”记录
 """
 
 from __future__ import annotations
@@ -134,7 +137,7 @@ def get_sectors() -> list[dict]:
                         "name": item.get("f14", "") or "",
                         "type": label,
                         "change_pct": item.get("f3", 0) or 0,
-                        "amount": item.get("f6", 0) or 0,
+                        "amount": item.get("f6", 0) or 0,  # 板块成交额
                     }
                 )
         except Exception as e:
@@ -185,7 +188,7 @@ def get_etfs() -> list[dict]:
                         "name": name,
                         "market": market,
                         "yf_ticker": f"{code}{suffix}",
-                        "amount": float(amount),
+                        "amount": float(amount),  # ETF成交额
                     }
                 )
 
@@ -325,22 +328,48 @@ def _match_score(sector_name: str, etf_name: str) -> float:
     e_tokens = set(_tokenize_cn(e_clean))
     if s_tokens and e_tokens:
         inter = s_tokens & e_tokens
-        # overlap 越多越好，同时惩罚只命中噪声
         overlap = len(inter)
         if overlap > 0:
             score = max(score, 10.0 + overlap * 3.0)
 
     # 4) 最弱：首字符/短子串命中
-    # 避免 1 字误判
     cn = re.sub(r"[A-Z0-9]+", "", s_norm)
-    if len(cn) >= 2:
-        if cn[:2] in e_clean:
-            score = max(score, 8.0)
-    if len(cn) >= 3:
-        if cn[:3] in e_clean:
-            score = max(score, 12.0)
+    if len(cn) >= 2 and cn[:2] in e_clean:
+        score = max(score, 8.0)
+    if len(cn) >= 3 and cn[:3] in e_clean:
+        score = max(score, 12.0)
 
     return score
+
+
+def _is_better_match(a: dict, b: dict) -> bool:
+    """
+    True 表示 a 比 b 更应该保留（用于 ETF 去重时选最优）
+    优先级：
+      1) match_score 更高
+      2) etf_amount 更大
+      3) sector_amount 更大（板块本身热度更高）
+      4) sector_name 字典序（稳定输出）
+    """
+    if b is None:
+        return True
+
+    a_score = float(a.get("match_score", 0) or 0)
+    b_score = float(b.get("match_score", 0) or 0)
+    if a_score != b_score:
+        return a_score > b_score
+
+    a_amt = float(a.get("etf_amount", 0) or 0)
+    b_amt = float(b.get("etf_amount", 0) or 0)
+    if a_amt != b_amt:
+        return a_amt > b_amt
+
+    a_samt = float(a.get("sector_amount", 0) or 0)
+    b_samt = float(b.get("sector_amount", 0) or 0)
+    if a_samt != b_samt:
+        return a_samt > b_samt
+
+    return str(a.get("sector_name", "")) < str(b.get("sector_name", ""))
 
 
 def match_sectors_to_etfs(
@@ -348,15 +377,15 @@ def match_sectors_to_etfs(
     etfs: list[dict],
     min_amount: float = 1e6,
     score_threshold: float = 10.0,
+    max_candidates: int = 1200,
 ) -> list[dict]:
     """
     为每个板块寻找成交额/流动性较好的“代表ETF”
 
-    关键改动：
-    - 允许同一只ETF被多个板块复用（不要 used_etf_codes 去重），否则匹配量必然很少。
-    - 匹配评分增强，并按（score, amount）综合排序。
+    需求：相同 ETF 只输出一次
+    - 如果多个板块匹配到同一只ETF，则只保留“最佳匹配”的那条记录
     """
-    # 预过滤：优先保留名称含 ETF 的（东财基金列表大多如此），并要求成交额 >= min_amount
+    # 预过滤：优先保留名称含 ETF 的，并要求成交额 >= min_amount
     valid = [
         e
         for e in etfs
@@ -369,16 +398,16 @@ def match_sectors_to_etfs(
     # 成交额从高到低（后面同分时优先大成交额）
     valid.sort(key=lambda x: x.get("amount", 0), reverse=True)
 
-    matched: list[dict] = []
+    # 仅在 top-N 流动性ETF里找（提升速度）
+    candidates = valid[:max_candidates] if len(valid) > max_candidates else valid
+
+    # ETF 去重：key= yf_ticker（更稳定）；如果缺失则退回 code
+    best_by_etf: dict[str, dict] = {}
 
     for sector in sectors:
         sname = sector.get("name", "") or ""
         best = None
         best_score = -1.0
-
-        # 为了速度：只在 top-N 流动性ETF里找（大幅提高效率）
-        # N 可以调大一点换取更高匹配率
-        candidates = valid[:1200] if len(valid) > 1200 else valid
 
         for etf in candidates:
             sc = _match_score(sname, etf.get("name", ""))
@@ -393,22 +422,40 @@ def match_sectors_to_etfs(
                 best_score = sc
                 best = etf
 
-        if best and best_score >= score_threshold:
-            matched.append(
-                {
-                    "sector_name": sname,
-                    "sector_type": sector.get("type", ""),
-                    "sector_code": sector.get("code", ""),
-                    "etf_code": best.get("code", ""),
-                    "etf_name": best.get("name", ""),
-                    "yf_ticker": best.get("yf_ticker", ""),
-                    "etf_amount": best.get("amount", 0),
-                    "match_score": round(float(best_score), 2),
-                }
-            )
+        if not best or best_score < score_threshold:
+            continue
+
+        record = {
+            "sector_name": sname,
+            "sector_type": sector.get("type", ""),
+            "sector_code": sector.get("code", ""),
+            "sector_amount": float(sector.get("amount", 0) or 0),
+            "etf_code": best.get("code", ""),
+            "etf_name": best.get("name", ""),
+            "yf_ticker": best.get("yf_ticker", ""),
+            "etf_amount": float(best.get("amount", 0) or 0),
+            "match_score": round(float(best_score), 2),
+        }
+
+        etf_key = record.get("yf_ticker") or record.get("etf_code") or ""
+        if not etf_key:
+            continue
+
+        prev = best_by_etf.get(etf_key)
+        if _is_better_match(record, prev):
+            best_by_etf[etf_key] = record
+
+    matched = list(best_by_etf.values())
+
+    # 输出稳定：优先 match_score，再看 etf_amount
+    matched.sort(
+        key=lambda x: (x.get("match_score", 0), x.get("etf_amount", 0)),
+        reverse=True,
+    )
 
     print(
-        f"[INFO] 成功匹配 {len(matched)} 个板块→ETF (阈值={score_threshold}, min_amount={min_amount})"
+        f"[INFO] 成功匹配 {len(matched)} 个板块→ETF（ETF去重后）"
+        f" (阈值={score_threshold}, min_amount={min_amount}, candidates={len(candidates)})"
     )
     return matched
 
@@ -422,7 +469,6 @@ def _standardize_df(df: pd.DataFrame) -> pd.DataFrame | None:
 
     # 有些版本会返回多级列，尽量压平
     if isinstance(df.columns, pd.MultiIndex):
-        # 取第二层常见字段
         df.columns = [c[-1] for c in df.columns]
 
     keep_cols = [
@@ -433,7 +479,6 @@ def _standardize_df(df: pd.DataFrame) -> pd.DataFrame | None:
 
     out = df[keep_cols].copy()
     out = out.dropna(subset=["Close"])
-    # 防止 volume 全空
     if "Volume" in out.columns:
         out["Volume"] = out["Volume"].fillna(0)
     return out
@@ -451,7 +496,6 @@ def _download_one(
     last_err = None
     for attempt in range(1, max_tries + 1):
         try:
-            # 方式1：Ticker.history
             t = yf.Ticker(ticker)
             df = t.history(period=period, auto_adjust=True)
             df = _standardize_df(df)
@@ -461,7 +505,6 @@ def _download_one(
             last_err = e
 
         try:
-            # 方式2：yf.download 单票兜底（有时比 Ticker 稳）
             df2 = yf.download(
                 tickers=ticker,
                 period=period,
@@ -476,11 +519,9 @@ def _download_one(
         except Exception as e:
             last_err = e
 
-        # 退避等待：0.6s, 1.2s, 2.4s + jitter
         sleep_s = (0.6 * (2 ** (attempt - 1))) + random.uniform(0.0, 0.35)
         time.sleep(sleep_s)
 
-    # 失败
     if last_err:
         print(
             f"[WARN] yfinance下载失败: {ticker} ({type(last_err).__name__}: {last_err})"
