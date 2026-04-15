@@ -26,7 +26,7 @@ from screener.report import generate_html
 # ═══════════════════════════════════════════════
 #  配置
 # ═══════════════════════════════════════════════
-LOCAL_MODE = os.environ.get("GITHUB_ACTIONS") is None
+LOCAL_MODE = os.getenv("LOCAL_MODE", "1") == "1"
 
 SMTP_SERVER = "smtp.qq.com"
 SMTP_PORT = 465

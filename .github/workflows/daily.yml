@@ -16,6 +16,7 @@ jobs:
       SMTP_PASS: ${{ secrets.SMTP_PASS }}
       TO_EMAIL:  ${{ secrets.TO_EMAIL }}
       TZ:        Asia/Shanghai
+      LOCAL_MODE: "0"
 
     steps:
       - name: Checkout code
