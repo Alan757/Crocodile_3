@@ -6,6 +6,11 @@ analyzer.py
 - 黑  马：日K在60日线下但OBV上穿均线
 - 突破策略：新高突破 / 突破60日线
 - 弱转强策略：OBV支撑弱转强 / 60日线支撑弱转强
+
+修正（周线二连阳）：
+1) “近几周有过二连阳就行”：在回看窗口内，只要出现任意连续两根已收盘周K为阳线，即为 True
+2) “当周周线除周五收线后外，都不能算成一次阳”：仅统计“已完成的周K”
+   - 以周五为周线结束（W-FRI），如果本周未到周五收盘，则不把本周计入周K序列
 """
 
 import pandas as pd
@@ -14,6 +19,8 @@ import numpy as np
 OBV_MA_PERIOD = 20  # OBV 均线周期
 MA_PERIOD = 60  # 主均线周期
 LOOKBACK_DAYS = 20  # 新高回看天数
+
+WEEKLY_LOOKBACK_WEEKS = 8  # “近几周”窗口：在最近 N 个已收盘周K里找二连阳
 
 
 # ═══════════════════════════════════════════════
@@ -33,14 +40,85 @@ def calc_obv(close: pd.Series, volume: pd.Series) -> pd.Series:
 
 
 # ═══════════════════════════════════════════════
+#  周线工具：只取“已收盘周K”，并判断近几周是否出现二连阳
+# ═══════════════════════════════════════════════
+def _get_closed_weekly(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    生成周线（周五收线，W-FRI），并且只保留“已完成的周K”：
+    - 如果最后一根周K的结束日期 > df最后交易日日期，说明本周未收完 → 丢弃最后一根
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    dfx = df.copy()
+    if not isinstance(dfx.index, pd.DatetimeIndex):
+        dfx.index = pd.to_datetime(dfx.index)
+
+    dfx = dfx.sort_index()
+
+    weekly = (
+        dfx.resample("W-FRI")
+        .agg(
+            {
+                "Open": "first",
+                "High": "max",
+                "Low": "min",
+                "Close": "last",
+                "Volume": "sum",
+            }
+        )
+        .dropna(subset=["Close"])
+    )
+
+    if weekly.empty:
+        return weekly
+
+    last_daily_date = dfx.index[-1].normalize()
+    last_week_end = weekly.index[-1].normalize()
+
+    # 若周线这根的标记日期（周五）还没到，说明本周未收盘，不计入
+    if last_week_end > last_daily_date:
+        weekly = weekly.iloc[:-1]
+
+    return weekly
+
+
+def _has_weekly_two_yang(
+    weekly: pd.DataFrame, lookback_weeks: int = WEEKLY_LOOKBACK_WEEKS
+) -> bool:
+    """
+    在最近 lookback_weeks 根“已收盘周K”中，是否存在任意连续两周为阳线（Close > Open）
+    """
+    if weekly is None or weekly.empty:
+        return False
+
+    w = weekly.tail(max(lookback_weeks, 2))
+    if len(w) < 2:
+        return False
+
+    yang = (w["Close"] > w["Open"]).astype(int).values  # 1/0
+    # 任意相邻两周同时为阳线
+    for i in range(1, len(yang)):
+        if yang[i] == 1 and yang[i - 1] == 1:
+            return True
+    return False
+
+
+# ═══════════════════════════════════════════════
 #  单只 ETF 分析
 # ═══════════════════════════════════════════════
 def analyze_etf(df: pd.DataFrame, etf_info: dict) -> dict | None:
     if df is None or len(df) < MA_PERIOD + 5:
         return None
 
-    close = df["Close"].copy().ffill().bfill()
-    volume = df["Volume"].copy().fillna(0)
+    # 确保索引为 DatetimeIndex 且有序（周线/滚动更稳）
+    dfx = df.copy()
+    if not isinstance(dfx.index, pd.DatetimeIndex):
+        dfx.index = pd.to_datetime(dfx.index)
+    dfx = dfx.sort_index()
+
+    close = dfx["Close"].copy().ffill().bfill()
+    volume = dfx["Volume"].copy().fillna(0)
 
     if close.iloc[-1] <= 0:
         return None
@@ -58,20 +136,9 @@ def analyze_etf(df: pd.DataFrame, etf_info: dict) -> dict | None:
     if pd.isna(curr_ma60) or pd.isna(curr_obv_ma):
         return None
 
-    # ── 周线重采样 ────────────────────────
-    weekly = (
-        df.resample("W")
-        .agg(
-            {
-                "Open": "first",
-                "High": "max",
-                "Low": "min",
-                "Close": "last",
-                "Volume": "sum",
-            }
-        )
-        .dropna(subset=["Close"])
-    )
+    # ── 周线（只取已收盘周K） ───────────────
+    weekly = _get_closed_weekly(dfx)
+    weekly_2_yang = _has_weekly_two_yang(weekly, lookback_weeks=WEEKLY_LOOKBACK_WEEKS)
 
     # ── 连续站上60日线天数 ─────────────────
     above = (close > ma60).values
@@ -86,25 +153,16 @@ def analyze_etf(df: pd.DataFrame, etf_info: dict) -> dict | None:
     obv_diff = obv - obv_ma
     obv_cross_up = False
     obv_cross_day = 999
-    for i in range(len(obv_diff) - 1, max(len(obv_diff) - 8, 0), -1):
+    # 注意：i-1 需要 i>=1
+    start_i = len(obv_diff) - 1
+    end_i = max(len(obv_diff) - 8, 1)
+    for i in range(start_i, end_i - 1, -1):
         if obv_diff.iloc[i] > 0 and obv_diff.iloc[i - 1] <= 0:
             obv_cross_up = True
             obv_cross_day = len(obv_diff) - 1 - i  # 0 = 今天
             break
 
     obv_above_ma = curr_obv > curr_obv_ma
-
-    # ── 周线二连阳 ────────────────────────
-    weekly_2_yang = False
-    if len(weekly) >= 3:
-        # 用倒数第2和第3根（因为当前周未收完）
-        w = weekly.iloc[-3:-1]
-        if len(w) == 2 and all(w["Close"] > w["Open"]):
-            weekly_2_yang = True
-    if not weekly_2_yang and len(weekly) >= 2:
-        w = weekly.iloc[-2:]
-        if len(w) == 2 and all(w["Close"] > w["Open"]):
-            weekly_2_yang = True
 
     # ── 放量 ──────────────────────────────
     avg_vol = volume.tail(60).mean()
@@ -127,7 +185,7 @@ def analyze_etf(df: pd.DataFrame, etf_info: dict) -> dict | None:
     # ── 弱转强策略 ────────────────────────
     w2s_types: list[str] = []
     # (a) OBV 支撑弱转强：近期回踩 OBV 均线后重新站上
-    if len(obv) >= 15:
+    if len(obv) >= 20 and len(obv_ma) >= 20:
         recent_gap = obv.iloc[-15:] - obv_ma.iloc[-15:]
         recent_gap_normed = recent_gap / obv_ma.iloc[-15:].abs().replace(0, 1)
         # 曾接近或跌穿 OBV 均线（gap < 2%），现在重新在上方
@@ -137,7 +195,7 @@ def analyze_etf(df: pd.DataFrame, etf_info: dict) -> dict | None:
                 w2s_types.append("OBV支撑弱转强")
 
     # (b) 60日均线支撑弱转强：价格回踩60日线后反弹
-    if len(close) >= 15 and not pd.isna(ma60.iloc[-15]):
+    if len(close) >= 20 and not pd.isna(ma60.iloc[-15]):
         price_gap = (close.iloc[-10:] - ma60.iloc[-10:]) / ma60.iloc[-10:]
         if price_gap.min() <= 0.03 and price_gap.min() >= -0.03:
             if curr_close > curr_ma60:
@@ -177,7 +235,7 @@ def analyze_etf(df: pd.DataFrame, etf_info: dict) -> dict | None:
     # 特别推荐标签
     tags: list[str] = []
     if weekly_2_yang:
-        tags.append("周线二连阳")
+        tags.append(f"近{WEEKLY_LOOKBACK_WEEKS}周曾二连阳(周五收线)")
     if high_volume:
         tags.append(f"近期放量×{vol_ratio:.1f}")
     if obv_above_ma:
