@@ -1,0 +1,42 @@
+name: Daily Sector Screener
+
+on:
+  schedule:
+    # 每个交易日 16:30 CST = 08:30 UTC 运行
+    - cron: '30 8 * * 1-5'
+  workflow_dispatch:  # 允许手动触发
+
+jobs:
+  run-screener:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      SMTP_USER: ${{ secrets.SMTP_USER }}
+      SMTP_PASS: ${{ secrets.SMTP_PASS }}
+      TO_EMAIL:  ${{ secrets.TO_EMAIL }}
+      TZ:        Asia/Shanghai
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run screener
+        run: python main.py
+
+      - name: Upload report artifact (backup)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-${{ github.run_id }}
+          path: report_*.html
+          retention-days: 7
